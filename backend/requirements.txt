@@ -6,3 +6,6 @@ opencv-python==4.8.0.76
 numpy==1.26.4
 Pillow==10.0.0
 python-multipart==0.0.6
+# GPU Optimization (NVIDIA CUDA)
+# Note: CUDA Toolkit 12.x and cuDNN 8.x must be installed on your system
+# Download from: https://developer.nvidia.com/cuda-downloads

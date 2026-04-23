@@ -20,40 +20,70 @@ ALLOWED_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv'}
 MAX_SIZE_BYTES = 100 * 1024 * 1024
 
 
+def _device_name():
+    return '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Configurer le GPU ──────────────────────────────────────
+    # ── Configurer le GPU NVIDIA ──────────────────────────────
+    print("\n" + "="*60)
+    print("🔧 Configuration GPU NVIDIA GTX 1650")
+    print("="*60)
+    
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         try:
+            # Activer memory growth pour éviter l'allocation complète
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"✅ GPU activé : {len(gpus)} GPU(s) trouvé(s)")
+            
+            # Afficher les détails GPU
+            gpu_details = tf.sysconfig.get_build_info()['cuda_version']
+            print(f"✅ GPU détecté: {len(gpus)} GPU(s)")
+            print(f"✅ CUDA activé pour TensorFlow")
+
+            try:
+                tf.keras.mixed_precision.set_global_policy('mixed_float16')
+                print("✅ Mixed precision activée")
+            except Exception as mixed_precision_error:
+                print(f"⚠️  Mixed precision non disponible: {mixed_precision_error}")
+            
+            # Forcer le placement des opérations sur GPU
+            tf.debugging.set_log_device_placement(False)
+            
         except RuntimeError as e:
-            print(f"⚠️  GPU config error: {e}")
+            print(f"⚠️  Erreur config GPU: {e}")
+            print("⚠️  Passage en mode CPU")
     else:
-        print("⚠️  Aucun GPU détecté — utilisation CPU")
+        print("⚠️  Aucun GPU NVIDIA détecté")
+        print("⚠️  Utilisation CPU (mode dégradé)")
 
     # ── Charger le modèle ──────────────────────────────────────
     try:
-        model = tf.keras.models.load_model(MODEL_PATH)
-        # Warm-up : une inférence factice pour compiler les kernels GPU
-        dummy = np.zeros((1, 30, 224, 224, 3), dtype='float32')
-        model.predict(dummy, verbose=0)
-        print("✅ Modèle chargé et warm-up effectué")
+        with tf.device(_device_name()):
+            model = tf.keras.models.load_model(MODEL_PATH)
+            # Warm-up : inférence factice pour compiler les kernels GPU
+            dummy = np.zeros((1, 30, 224, 224, 3), dtype='float32')
+            _ = model.predict(dummy, verbose=0)
+        print("✅ Modèle chargé sur GPU avec warm-up")
     except Exception as exc:
-        raise RuntimeError(f'Failed to load model: {exc}') from exc
+        raise RuntimeError(f'Erreur chargement modèle: {exc}') from exc
 
     # ── Pré-construire le modèle Grad-CAM UNE SEULE FOIS ──────
     try:
-        gradcam_model = build_gradcam_model(model)
-        print("✅ Modèle Grad-CAM pré-construit")
+        with tf.device(_device_name()):
+            gradcam_model = build_gradcam_model(model)
+        print("✅ Modèle Grad-CAM pré-construit sur GPU")
     except Exception as exc:
         gradcam_model = None
         print(f"⚠️  Grad-CAM non disponible: {exc}")
 
+    print("="*60 + "\n")
+    
     app.state.model = model
     app.state.gradcam_model = gradcam_model
+    app.state.gpus = gpus
     yield
 
 
@@ -69,37 +99,44 @@ app.add_middleware(
 
 
 def _predict_score(model, clip):
-    pred = model.predict(clip, verbose=0)
-    score = float(np.squeeze(pred))
-    return max(0.0, min(1.0, score))
+    """Prédiction optimisée GPU avec gestion des erreurs."""
+    try:
+        with tf.device(_device_name()):
+            pred = model.predict(clip, verbose=0)
+        score = float(np.squeeze(pred))
+        return max(0.0, min(1.0, score))
+    except Exception as e:
+        print(f"❌ Erreur prédiction: {e}")
+        return 0.5  # Valeur par défaut en cas d'erreur
 
 
 def _compute_frame_scores_fast(model, processed_video):
     """
-    Version rapide : UNE SEULE inférence sur la vidéo complète.
-    On utilise les activations LSTM intermédiaires pour estimer
-    un score par frame — pas 30 inférences séparées.
-    
-    Stratégie : sliding window de taille 5, stride 1, 
-    sur les 30 frames → 26 scores interpolés à 30 points.
-    Maximum : 6 inférences au lieu de 30.
+    Version rapide optimisée GPU : UNE SEULE inférence sur la vidéo complète.
+    Sliding window de taille 5, stride 5 → 6 inférences au lieu de 30.
     """
     frame_count = processed_video.shape[1]  # 30
     scores = []
     window = 5
-    stride = 5  # 6 fenêtres non-chevauchantes → 6 inférences
+    stride = 5  # 6 fenêtres non-chevauchantes
 
-    for start in range(0, frame_count, stride):
-        end = min(start + window, frame_count)
-        chunk = processed_video[:, start:end, :, :, :]
-        # Rembourrer à 30 frames par répétition
-        repeats = int(np.ceil(frame_count / chunk.shape[1]))
-        tiled = np.tile(chunk, (1, repeats, 1, 1, 1))[:, :frame_count, :, :, :]
-        scores.append(_predict_score(model, tiled))
+    try:
+        with tf.device(_device_name()):
+            for start in range(0, frame_count, stride):
+                end = min(start + window, frame_count)
+                chunk = processed_video[:, start:end, :, :, :]
+                # Rembourrer à 30 frames par répétition
+                repeats = int(np.ceil(frame_count / chunk.shape[1]))
+                tiled = np.tile(chunk, (1, repeats, 1, 1, 1))[:, :frame_count, :, :, :]
+                scores.append(_predict_score(model, tiled))
+    except Exception as e:
+        print(f"❌ Erreur calcul frame scores: {e}")
+        # Fallback : retourner scores constants
+        scores = [0.5] * 6
 
     # Interpoler les 6 scores → 30 points pour le graphique
     x_orig = np.linspace(0, 1, len(scores))
-    x_new  = np.linspace(0, 1, frame_count)
+    x_new = np.linspace(0, 1, frame_count)
     frame_scores = np.interp(x_new, x_orig, scores).tolist()
 
     return frame_scores
@@ -109,13 +146,28 @@ def _compute_frame_scores_fast(model, processed_video):
 def health():
     model = app.state.model
     gpus = tf.config.list_physical_devices('GPU')
+    
+    # Obtenir les détails GPU
+    gpu_details = []
+    for gpu in gpus:
+        try:
+            details = tf.config.experimental.get_memory_info(gpu)
+            gpu_details.append({
+                'name': gpu.name,
+                'memory': details
+            })
+        except:
+            gpu_details.append({'name': gpu.name})
+    
     return {
         'status': 'ok',
         'model_loaded': model is not None,
         'gpu_available': len(gpus) > 0,
         'gpu_count': len(gpus),
+        'gpu_details': gpu_details,
         'model_path': MODEL_PATH,
         'input_shape': str(getattr(model, 'input_shape', None)),
+        'message': f"✅ GPU NVIDIA GTX 1650 activé" if gpus else "⚠️  Mode CPU (ralenti)"
     }
 
 

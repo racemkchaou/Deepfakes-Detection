@@ -110,12 +110,38 @@ function ResultCard({ result, onReset }) {
   }, [timelineData]);
 
   const middleSrc = result?.middle_frame_b64 ? `data:image/png;base64,${result.middle_frame_b64}` : '';
-  const gradcamSrc = result?.gradcam_b64 ? `data:image/png;base64,${result.gradcam_b64}` : '';
+  const gradcamRaw = typeof result?.gradcam_b64 === 'string' ? result.gradcam_b64.trim() : '';
+  const hasValidGradcam = gradcamRaw.length > 100;
+  const gradcamSrc = hasValidGradcam ? `data:image/png;base64,${gradcamRaw}` : '';
 
   const [gradcamLoaded, setGradcamLoaded] = useState(false);
+  const [gradcamError, setGradcamError] = useState(false);
 
   useEffect(() => {
+    if (!gradcamSrc) {
+      setGradcamLoaded(false);
+      setGradcamError(false);
+      return;
+    }
+
     setGradcamLoaded(false);
+    setGradcamError(false);
+
+    const img = new Image();
+    img.onload = () => {
+      setGradcamLoaded(true);
+      setGradcamError(false);
+    };
+    img.onerror = () => {
+      setGradcamLoaded(false);
+      setGradcamError(true);
+    };
+    img.src = gradcamSrc;
+
+    return () => {
+      img.onload = null;
+      img.onerror = null;
+    };
   }, [gradcamSrc]);
 
   return (
@@ -220,19 +246,25 @@ function ResultCard({ result, onReset }) {
 
             <div>
               <p className="mb-2 font-semibold text-slate-700 dark:text-slate-200">AI Focus Map</p>
-              <div className="relative overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700">
-                {!gradcamLoaded && <div className="shimmer h-64 w-full" />}
+              <div className="relative h-64 overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700">
+                {gradcamSrc && !gradcamLoaded && !gradcamError && <div className="shimmer absolute inset-0" />}
                 {gradcamSrc ? (
                   <img
                     src={gradcamSrc}
                     alt="Grad-CAM heatmap"
-                    className={`h-64 w-full object-cover transition duration-300 ${
+                    className={`h-full w-full object-cover transition duration-300 ${
                       gradcamLoaded ? 'opacity-100' : 'opacity-0'
                     }`}
-                    onLoad={() => setGradcamLoaded(true)}
                   />
                 ) : (
-                  <div className="h-64 w-full bg-slate-200 dark:bg-slate-700" />
+                  <div className="grid h-full w-full place-items-center bg-slate-200 px-4 text-center text-sm text-slate-600 dark:bg-slate-700 dark:text-slate-200">
+                    Heatmap not available for this video.
+                  </div>
+                )}
+                {gradcamError && (
+                  <div className="absolute inset-0 grid place-items-center bg-slate-200 px-4 text-center text-sm text-slate-600 dark:bg-slate-700 dark:text-slate-200">
+                    Heatmap generation failed. Try another video.
+                  </div>
                 )}
               </div>
             </div>
